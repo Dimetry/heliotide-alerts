@@ -1,0 +1,58 @@
+name: Check alerts
+
+# Every 5 minutes (GitHub may start a run 5–15 minutes late; free for public repositories).
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_kind:
+        description: "Send one test alert of this kind (storm, flare, radiation, wind, nearby, aurora). Empty = normal check."
+        required: false
+        default: ""
+      test_cell:
+        description: "Area cell for nearby/aurora tests, e.g. 9_-25. Empty = worldwide."
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # to save state.json (which events were already sent)
+
+concurrency:
+  group: check-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check sources and send new alerts
+        env:
+          CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
+          CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
+          CK_ENV: ${{ vars.CK_ENV || 'development' }}
+          TEST_KIND: ${{ inputs.test_kind }}
+          TEST_CELL: ${{ inputs.test_cell }}
+        run: |
+          if [ -n "$TEST_KIND" ]; then
+            if [ -n "$TEST_CELL" ]; then python3 checker.py --test "$TEST_KIND" --cell "$TEST_CELL"
+            else python3 checker.py --test "$TEST_KIND"; fi
+          else
+            python3 checker.py
+          fi
+
+      - name: Save state
+        if: ${{ inputs.test_kind == '' }}
+        run: |
+          git config user.name "heliotide-alerts"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          # Commit when something changed, and at least once a week: GitHub pauses schedules
+          # in repositories with no activity for 60 days.
+          last=$(git log -1 --format=%ct -- state.json 2>/dev/null || echo 0)
+          if ! git diff --cached --quiet || [ $(( $(date +%s) - last )) -gt 604800 ]; then
+            git commit --allow-empty -m "state $(date -u +%Y-%m-%dT%H:%MZ)" && git push
+          fi
