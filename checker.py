@@ -214,19 +214,20 @@ def aurora():
 
 
 def quakes():
-    """Earthquakes M5.5+. The person chooses the strength and distance in Settings."""
+    """Earthquakes M3+ (the app offers 3+, 4+, 5.5+, 6+, 7+). The person chooses strength and distance."""
     events = []
-    feed = get_json("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson")
+    feed = get_json("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson")
     for f in feed["features"]:
         p = f["properties"]
         mag = p.get("mag") or 0
-        if mag < 5.5:
+        if mag < 3:
             continue
         issued = dt.datetime.fromtimestamp(p["time"] / 1000, dt.timezone.utc)
         if hours_ago(issued) > 6:
             continue
         lon, lat = f["geometry"]["coordinates"][:2]
-        word = "Major earthquake" if mag >= 7 else "Strong earthquake" if mag >= 6 else "Earthquake"
+        word = ("Major earthquake" if mag >= 7 else "Strong earthquake" if mag >= 6
+                else "Earthquake" if mag >= 4.5 else "Light earthquake")
         events.append(Event(f"quake-{f['id']}", "quake", f"{word} near you",
                             f"Magnitude {mag:.1f}, {near_place(p.get('place'))}.",
                             issued, level=mag, zones=zones_for("quake", lat, lon), lat=lat, lon=lon))
