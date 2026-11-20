@@ -39,7 +39,7 @@ ENVIRONMENT = os.environ.get("CK_ENV", "development")
 KEY_ID = os.environ.get("CK_KEY_ID", "")
 PRIVATE_KEY = os.environ.get("CK_PRIVATE_KEY", "")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-CELL_DEG = 5  # must match AlertsService.cell(for:) in the app
+CELL_DEG = 1  # about 110 km; must match AlertsService.cellDegrees in the app
 NOW = dt.datetime.now(dt.timezone.utc)
 
 SWPC = "https://services.swpc.noaa.gov"
@@ -96,13 +96,39 @@ def cells_within(lat, lon, km):
 
 
 class Event:
-    def __init__(self, key, kind, title, body, cells, issued):
+    """One alert. Worldwide kinds have no zones. Local kinds have three zones of grid cells:
+    zone1 = close / strong, zone2 = middle, zone3 = far / weak (see ZONES). The phone subscribes
+    to the zone the person chose in Settings, and to `level >= ` their minimum strength."""
+
+    def __init__(self, key, kind, title, body, issued, level=0.0, zones=None, lat=None, lon=None):
         self.key = re.sub(r"[^A-Za-z0-9_.-]", "-", key)[:200]
-        self.kind, self.title, self.body, self.cells, self.issued = kind, title, body, cells, issued
+        self.kind, self.title, self.body, self.issued = kind, title, body, issued
+        self.level, self.zones, self.lat, self.lon = float(level), zones, lat, lon
 
     def __repr__(self):
-        where = "global" if self.cells == ["global"] else f"{len(self.cells)} cells"
-        return f"[{self.kind}] {self.title} — {self.body} ({where}) key={self.key}"
+        where = "global" if not self.zones else "/".join(str(len(z)) for z in self.zones) + " cells"
+        return f"[{self.kind} {self.level:g}] {self.title} — {self.body} ({where}) key={self.key}"
+
+
+# Distances (km) of the three zones per local kind. The app offers the same three choices.
+ZONES = {"quake": (300, 1000, 2000), "tsunami": (500, 1000, 2000), "cyclone": (300, 600, 1000),
+         "flood": (100, 300, 600), "volcano": (100, 300, 600), "fire": (50, 100, 300)}
+
+
+def zones_for(kind, lat, lon):
+    return [cells_within(lat, lon, km) for km in ZONES[kind]]
+
+
+WORD = {1: "minor", 2: "moderate", 3: "strong", 4: "severe", 5: "extreme"}
+
+
+def near_place(place):
+    """USGS '35 km SW of Kodiak, Alaska' → 'near Kodiak, Alaska'; 'southeast of the Loyalty Islands' stays."""
+    place = (place or "").strip()
+    short = re.sub(r"^\d+\s*km\s+[NSEW]{1,3}\s+of\s+", "", place)
+    if not short:
+        return "far from towns"
+    return f"near {short}" if short != place or not re.match(r"(?i)(north|south|east|west|off|central)", short) else short
 
 
 # ---------- sources ----------
@@ -120,31 +146,29 @@ def noaa_alerts():
         issued = parse_time(a["issue_datetime"])
         if hours_ago(issued) > 6:
             continue
-        key = f"noaa-{code}-{serial}"
         m = re.fullmatch(r"ALTK0([5-9])", code)
         if m:
-            k = int(m.group(1))
+            g = int(m.group(1)) - 4
             # NOAA repeats "Kp 5 reached" during one storm: one push per level per UTC day.
-            events.append(Event(f"storm-G{k - 4}-{issued:%Y%m%d}", "storm", f"Magnetic storm G{k - 4}",
-                                f"Kp {k} reached. Aurora may reach lower latitudes; GPS and radio can be disturbed.",
-                                ["global"], issued))
+            events.append(Event(f"storm-G{g}-{issued:%Y%m%d}", "storm", f"{WORD[g].capitalize()} magnetic storm",
+                                "Aurora may be seen farther from the poles than usual. GPS and radio may be less accurate.",
+                                issued, level=g))
         elif code == "ALTXMF":
-            events.append(Event(key, "flare", "Strong solar flare",
-                                "X-rays passed class M5. Short radio blackouts are possible on the day side of Earth.",
-                                ["global"], issued))
+            events.append(Event(f"noaa-{code}-{serial}", "flare", "Strong solar flare",
+                                "Short radio blackouts are possible on the sunlit side of Earth.", issued, level=1))
         elif code == "SUMX01":
             cls = re.search(r"X-ray Class:\s*([A-Z][\d.]+)", msg)
             name = cls.group(1) if cls else "X"
-            events.append(Event(key, "flare", f"{name} solar flare",
-                                "An X-class flare: the strongest kind. Radio blackouts are possible on the day side of Earth.",
-                                ["global"], issued))
+            events.append(Event(f"noaa-{code}-{serial}", "flare", "Very strong solar flare",
+                                f"The strongest class ({name}). Radio may fade on the sunlit side of Earth.",
+                                issued, level=2))
         else:
             m = re.fullmatch(r"ALTPX([1-3])", code)
             if m:
-                s = int(m.group(1))
-                events.append(Event(key, "radiation", f"Radiation storm S{s}",
-                                    "High-energy protons are raised. A risk for satellites and polar flights, not on the ground.",
-                                    ["global"], issued))
+                s_ = int(m.group(1))
+                events.append(Event(f"noaa-{code}-{serial}", "radiation", "Radiation storm",
+                                    f"{WORD[s_].capitalize()}. Satellites and polar flights may be affected. No risk on the ground.",
+                                    issued, level=s_))
     return events
 
 
@@ -158,7 +182,7 @@ def fast_wind():
         return []
     issued = parse_time(r["time_tag"])
     return [Event(f"wind-{issued:%Y%m%d}", "wind", "Fast solar wind",
-                  f"{round(speed)} km/s. Magnetic storms and aurora become more likely.", ["global"], issued)]
+                  f"{round(speed)} km/s, faster than usual. Storms and aurora become more likely.", issued, level=1)]
 
 
 def storm_now():
@@ -168,100 +192,125 @@ def storm_now():
 
 
 def aurora():
-    """During a storm: one record for every area where OVATION gives a real chance of aurora."""
+    """During a storm: one record per hemisphere. Zones by chance: zone1 50%+, zone2 30%+, zone3 10%+."""
     if not storm_now():
         return []
     grid = get_json(f"{SWPC}/json/ovation_aurora_latest.json")["coordinates"]
-    cells = sorted({cell(lat, lon) for lon, lat, p in grid if p >= 20})
-    if not cells:
-        return []
     half = "am" if NOW.hour < 12 else "pm"
-    return [Event(f"aurora-{NOW:%Y%m%d}-{half}", "aurora", "Aurora possible tonight",
-                  "A magnetic storm is on. After dark, look toward the pole, away from city lights.",
-                  cells, NOW)]
+    events = []
+    for name, north in (("north", True), ("south", False)):
+        best = {}
+        for lon, lat, p in grid:
+            if (lat >= 0) == north and p >= 10:
+                c = cell(lat, lon)
+                best[c] = max(best.get(c, 0), p)
+        if not best:
+            continue
+        zones = [sorted(c for c, p in best.items() if p >= t) for t in (50, 30, 10)]
+        events.append(Event(f"aurora-{name}-{NOW:%Y%m%d}-{half}", "aurora", "Aurora possible tonight",
+                            f"Look {name} after dark, away from city lights. Best if the sky is clear.",
+                            NOW, zones=zones))
+    return events
 
 
 def quakes():
-    """Strong earthquakes. The stronger, the farther they matter."""
+    """Earthquakes M5.5+. The person chooses the strength and distance in Settings."""
     events = []
     feed = get_json("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson")
     for f in feed["features"]:
         p = f["properties"]
         mag = p.get("mag") or 0
-        km = 2000 if mag >= 7 else 1000 if mag >= 6 else 300 if mag >= 5.5 else 0
-        if not km:
+        if mag < 5.5:
             continue
         issued = dt.datetime.fromtimestamp(p["time"] / 1000, dt.timezone.utc)
         if hours_ago(issued) > 6:
             continue
         lon, lat = f["geometry"]["coordinates"][:2]
-        events.append(Event(f"quake-{f['id']}", "nearby", f"M{mag:.1f} earthquake",
-                            f"{p.get('place') or 'Strong earthquake'}. Source: USGS.",
-                            cells_within(lat, lon, km), issued))
+        word = "Major earthquake" if mag >= 7 else "Strong earthquake" if mag >= 6 else "Earthquake"
+        events.append(Event(f"quake-{f['id']}", "quake", f"{word} near you",
+                            f"Magnitude {mag:.1f}, {near_place(p.get('place'))}.",
+                            issued, level=mag, zones=zones_for("quake", lat, lon), lat=lat, lon=lon))
     return events
 
 
-GDACS_TYPES = {"TC": ("Tropical cyclone", 1000), "FL": ("Flood", 300),
-               "VO": ("Volcano", 300), "WF": ("Wildfire", 200)}
+GDACS_KIND = {"TC": "cyclone", "FL": "flood", "VO": "volcano", "WF": "fire"}
 
 
 def gdacs():
-    """UN/EU disaster alerts, orange and red only. A new episode at a higher level alerts again."""
+    """UN/EU disaster alerts, orange (level 2) and red (3). A new episode at a higher level alerts again."""
     url = ("https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
            "?eventlist=TC;FL;VO;WF&alertlevel=orange;red")
     events = []
     for f in get_json(url).get("features", []):
         p = f["properties"]
-        if str(p.get("iscurrent")).lower() != "true" or p.get("eventtype") not in GDACS_TYPES:
+        kind = GDACS_KIND.get(p.get("eventtype"))
+        if str(p.get("iscurrent")).lower() != "true" or not kind:
             continue
-        kind_name, km = GDACS_TYPES[p["eventtype"]]
-        level = p.get("alertlevel", "")
+        level_name = (p.get("alertlevel") or "").lower()
+        level = 3 if level_name == "red" else 2
         lon, lat = f["geometry"]["coordinates"][:2]
-        name = p.get("name") or kind_name
-        country = p.get("country") or ""
-        events.append(Event(f"gdacs-{p['eventtype']}-{p['eventid']}-{level}", "nearby", name,
-                            f"{level} alert from GDACS" + (f" · {country}" if country else "") + ".",
-                            cells_within(lat, lon, km), NOW))
+        country = p.get("country") or "your region"
+        name = re.sub(r"^(Tropical Cyclone|Volcano)\s+", "", p.get("name") or "").split("-")[0].strip().title()
+        if kind == "cyclone":
+            title, body = "Tropical cyclone near you", f"{name}, {level_name} alert, {country}. Follow local officials."
+        elif kind == "flood":
+            title, body = "Flood alert near you", f"{level_name.capitalize()} alert in {country}. Follow local officials."
+        elif kind == "volcano":
+            title, body = "Volcano alert near you", f"{name}, {country}, {level_name} alert."
+        else:
+            title, body = "Large wildfire near you", f"{level_name.capitalize()} alert in {country}. Smoke may reach your area."
+        events.append(Event(f"gdacs-{p['eventtype']}-{p['eventid']}-{level_name}", kind, title, body, NOW,
+                            level=level, zones=zones_for(kind, lat, lon), lat=lat, lon=lon))
     return events
 
 
 def tsunami():
     """NOAA tsunami centers (Alaska: US/Canada coasts; Hawaii: Pacific). Not 'Information' bulletins."""
     ns = {"a": "http://www.w3.org/2005/Atom", "geo": "http://www.w3.org/2003/01/geo/wgs84_pos#"}
+    rank = {"Watch": 1, "Advisory": 2, "Threat": 2, "Warning": 3}
     events = []
     for feed in ("PAAQ", "PHEB"):
         root = ET.fromstring(get(f"https://www.tsunami.gov/events/xml/{feed}Atom.xml"))
         for e in root.findall("a:entry", ns):
             summary = ET.tostring(e.find("a:summary", ns), encoding="unicode", method="text")
             cat = re.search(r"Category:\s*(\w+)", summary)
-            if not cat or cat.group(1) not in ("Warning", "Advisory", "Watch", "Threat"):
+            if not cat or cat.group(1) not in rank:
                 continue
             issued = parse_time(e.findtext("a:updated", "", ns))
             if hours_ago(issued) > 6:
                 continue
             lat, lon = float(e.findtext("geo:lat", "0", ns)), float(e.findtext("geo:long", "0", ns))
-            region = e.findtext("a:title", "", ns).strip()
-            events.append(Event(f"tsunami-{e.findtext('a:id', '', ns)}", "nearby",
-                                f"Tsunami {cat.group(1).lower()}",
-                                f"{region}. Follow local officials. Source: NOAA.",
-                                cells_within(lat, lon, 2000), issued))
+            region = near_place(e.findtext("a:title", "", ns).strip())
+            events.append(Event(f"tsunami-{e.findtext('a:id', '', ns)}", "tsunami",
+                                f"Tsunami {cat.group(1).lower()} near you",
+                                f"{region[0].upper() + region[1:]}. Follow local officials.",
+                                issued, level=rank[cat.group(1)], zones=zones_for("tsunami", lat, lon), lat=lat, lon=lon))
     return events
 
 
 # ---------- CloudKit ----------
+
+def fields(event):
+    f = {"kind": {"value": event.kind},
+         "title": {"value": event.title},
+         "body": {"value": event.body},
+         "level": {"value": event.level, "type": "DOUBLE"},
+         "issued": {"value": int(event.issued.timestamp() * 1000), "type": "TIMESTAMP"}}
+    for i, cells in enumerate(event.zones or [], start=1):
+        if cells:   # CloudKit rejects empty lists
+            f[f"zone{i}"] = {"value": cells, "type": "STRING_LIST"}
+    if event.lat is not None:
+        f["lat"] = {"value": float(event.lat), "type": "DOUBLE"}
+        f["lon"] = {"value": float(event.lon), "type": "DOUBLE"}
+    return f
+
 
 def cloudkit_create(event):
     """Creates the Alert record. Returns True when written (or it was already there)."""
     path = f"/database/1/{CONTAINER}/{ENVIRONMENT}/public/records/modify"
     body = json.dumps({"operations": [{"operationType": "create", "record": {
         "recordType": "Alert", "recordName": event.key,
-        "fields": {
-            "kind": {"value": event.kind},
-            "title": {"value": event.title},
-            "body": {"value": event.body},
-            "cells": {"value": event.cells, "type": "STRING_LIST"},
-            "issued": {"value": int(event.issued.timestamp() * 1000), "type": "TIMESTAMP"},
-        }}}]}, separators=(",", ":")).encode()
+        "fields": fields(event)}}]}, separators=(",", ":")).encode()
     date = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
     digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
     message = f"{date}:{digest}:{path}".encode()
@@ -316,9 +365,10 @@ def main():
 
     if "--test" in args:
         kind = args[args.index("--test") + 1]
-        cells = [args[args.index("--cell") + 1]] if "--cell" in args else ["global"]
-        e = Event(f"test-{NOW:%Y%m%d%H%M%S}", kind, "Heliotide test alert",
-                  "If you see this, alerts work.", cells, NOW)
+        cell_arg = args[args.index("--cell") + 1] if "--cell" in args else None
+        zones = [[cell_arg]] * 3 if cell_arg else None
+        e = Event(f"test-{NOW:%Y%m%d%H%M%S}-{kind}", kind, "Heliotide test alert",
+                  "If you see this, alerts work.", NOW, level=99, zones=zones)
         print("TEST", e)
         ok = cloudkit_create(e) if live else True
         print("sent" if ok and live else "dry run (no CloudKit key)" if ok else "FAILED")
