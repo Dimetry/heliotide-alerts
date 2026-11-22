@@ -1,9 +1,12 @@
 name: Check alerts
 
-# Every 5 minutes (GitHub may start a run 5–15 minutes late; free for public repositories).
+# GitHub runs "*/5" schedules in free repositories only every few hours (seen 2026-11-21: runs 4–8 h
+# apart). So one run now loops for about 5 h 45 min, checking every 5 minutes, and then starts the
+# next run itself (workflow_dispatch from GITHUB_TOKEN does start a new run). The schedule stays as a
+# safety net: if the chain ever breaks, the next scheduled run starts it again. Free for public repos.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       test_kind:
@@ -17,19 +20,17 @@ on:
 
 permissions:
   contents: write   # to save state.json (which events were already sent)
-
-concurrency:
-  group: check-alerts
-  cancel-in-progress: false
+  actions: write    # to start the next looping run
 
 jobs:
-  check:
+  # One test alert, right away (does not wait for the loop).
+  test:
+    if: ${{ inputs.test_kind != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check sources and send new alerts
+      - name: Send one test alert
         env:
           CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
           CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
@@ -37,23 +38,48 @@ jobs:
           TEST_KIND: ${{ inputs.test_kind }}
           TEST_CELL: ${{ inputs.test_cell }}
         run: |
-          if [ -n "$TEST_KIND" ]; then
-            if [ -n "$TEST_CELL" ]; then python3 checker.py --test "$TEST_KIND" --cell "$TEST_CELL"
-            else python3 checker.py --test "$TEST_KIND"; fi
-          else
-            python3 checker.py
-          fi
+          if [ -n "$TEST_CELL" ]; then python3 checker.py --test "$TEST_KIND" --cell "$TEST_CELL"
+          else python3 checker.py --test "$TEST_KIND"; fi
 
-      - name: Save state
-        if: ${{ inputs.test_kind == '' }}
+  # The normal check: a loop every 5 minutes. Only one loop at a time; a second start waits or is dropped.
+  loop:
+    if: ${{ inputs.test_kind == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: check-alerts-loop
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every 5 minutes, save state when it changes
+        env:
+          CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
+          CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
+          CK_ENV: ${{ vars.CK_ENV || 'development' }}
         run: |
           git config user.name "heliotide-alerts"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [ -f state.json ] || exit 0   # dry run (no CloudKit key yet): nothing to save
-          git add state.json
-          # Commit when something changed, and at least once a week: GitHub pauses schedules
-          # in repositories with no activity for 60 days.
-          last=$(git log -1 --format=%ct -- state.json 2>/dev/null || echo 0)
-          if ! git diff --cached --quiet || [ $(( $(date +%s) - last )) -gt 604800 ]; then
-            git commit --allow-empty -m "state $(date -u +%Y-%m-%dT%H:%MZ)" && git push
-          fi
+          end=$(( $(date +%s) + 345 * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            started=$(date +%s)
+            python3 checker.py || echo "check failed, will try again in 5 minutes"
+            if [ -f state.json ]; then
+              git add state.json
+              # Commit when something changed, and at least once a week: GitHub pauses schedules
+              # in repositories with no activity for 60 days.
+              last=$(git log -1 --format=%ct -- state.json 2>/dev/null || echo 0)
+              if ! git diff --cached --quiet || [ $(( $(date +%s) - last )) -gt 604800 ]; then
+                git commit --allow-empty -q -m "state $(date -u +%Y-%m-%dT%H:%MZ)"
+                git pull -q --rebase && git push -q || echo "push failed, will try again"
+              fi
+            fi
+            wait=$(( 300 - ($(date +%s) - started) ))
+            [ "$wait" -gt 0 ] && sleep "$wait"
+          done
+
+      - name: Start the next loop
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run check.yml -R "$GITHUB_REPOSITORY" --ref main
