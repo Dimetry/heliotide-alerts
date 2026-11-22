@@ -34,6 +34,8 @@ jobs:
         env:
           CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
           CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
+          CK_PROD_KEY_ID: ${{ secrets.CK_PROD_KEY_ID }}
+          CK_PROD_PRIVATE_KEY: ${{ secrets.CK_PROD_PRIVATE_KEY }}
           CK_ENV: ${{ vars.CK_ENV || 'development' }}
           TEST_KIND: ${{ inputs.test_kind }}
           TEST_CELL: ${{ inputs.test_cell }}
@@ -56,6 +58,8 @@ jobs:
         env:
           CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
           CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
+          CK_PROD_KEY_ID: ${{ secrets.CK_PROD_KEY_ID }}
+          CK_PROD_PRIVATE_KEY: ${{ secrets.CK_PROD_PRIVATE_KEY }}
           CK_ENV: ${{ vars.CK_ENV || 'development' }}
         run: |
           git config user.name "heliotide-alerts"

@@ -38,6 +38,17 @@ CONTAINER = "iCloud.dev.spacecast.app"
 ENVIRONMENT = os.environ.get("CK_ENV", "development")
 KEY_ID = os.environ.get("CK_KEY_ID", "")
 PRIVATE_KEY = os.environ.get("CK_PRIVATE_KEY", "")
+# Production (TestFlight / App Store builds subscribe there). When its key is set, every alert is
+# written to BOTH environments: cable (Debug) builds get it from development, TestFlight from production.
+PROD_KEY_ID = os.environ.get("CK_PROD_KEY_ID", "")
+PROD_PRIVATE_KEY = os.environ.get("CK_PROD_PRIVATE_KEY", "")
+
+def targets():
+    """(environment, key id, private key) to write to."""
+    out = [(ENVIRONMENT, KEY_ID, PRIVATE_KEY)]
+    if PROD_KEY_ID and PROD_PRIVATE_KEY and ENVIRONMENT != "production":
+        out.append(("production", PROD_KEY_ID, PROD_PRIVATE_KEY))
+    return out
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 CELL_DEG = 1  # about 110 km; must match AlertsService.cellDegrees in the app
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -307,8 +318,17 @@ def fields(event):
 
 
 def cloudkit_create(event):
-    """Creates the Alert record. Returns True when written (or it was already there)."""
-    path = f"/database/1/{CONTAINER}/{ENVIRONMENT}/public/records/modify"
+    """Creates the Alert record in every target environment. True when all have it."""
+    ok = True
+    for env, key_id, private_key in targets():
+        if not cloudkit_create_in(event, env, key_id, private_key):
+            ok = False
+    return ok
+
+
+def cloudkit_create_in(event, env, key_id, private_key):
+    """Creates the Alert record in one environment. Returns True when written (or it was already there)."""
+    path = f"/database/1/{CONTAINER}/{env}/public/records/modify"
     body = json.dumps({"operations": [{"operationType": "create", "record": {
         "recordType": "Alert", "recordName": event.key,
         "fields": fields(event)}}]}, separators=(",", ":")).encode()
@@ -316,7 +336,7 @@ def cloudkit_create(event):
     digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
     message = f"{date}:{digest}:{path}".encode()
     with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as k:
-        k.write(PRIVATE_KEY)
+        k.write(private_key)
         key_path = k.name
     try:
         sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path], input=message,
@@ -325,7 +345,7 @@ def cloudkit_create(event):
         os.unlink(key_path)
     req = urllib.request.Request("https://api.apple-cloudkit.com" + path, data=body, method="POST", headers={
         "Content-Type": "application/json",
-        "X-Apple-CloudKit-Request-KeyID": KEY_ID,
+        "X-Apple-CloudKit-Request-KeyID": key_id,
         "X-Apple-CloudKit-Request-ISO8601Date": date,
         "X-Apple-CloudKit-Request-SignatureV1": base64.b64encode(sig).decode(),
     })
@@ -333,13 +353,13 @@ def cloudkit_create(event):
         with urllib.request.urlopen(req, timeout=30) as r:
             result = json.loads(r.read())
     except urllib.error.HTTPError as e:
-        print(f"  CloudKit HTTP {e.code}: {e.read().decode()[:300]}")
+        print(f"  CloudKit {env} HTTP {e.code}: {e.read().decode()[:300]}")
         return False
     rec = (result.get("records") or [{}])[0]
     if "serverErrorCode" in rec:
         if rec["serverErrorCode"] in ("RECORD_EXISTS", "CONFLICT"):
             return True
-        print(f"  CloudKit error: {rec.get('serverErrorCode')} {rec.get('reason', '')}")
+        print(f"  CloudKit {env} error: {rec.get('serverErrorCode')} {rec.get('reason', '')}")
         return False
     return True
 
