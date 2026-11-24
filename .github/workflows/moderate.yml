@@ -1,0 +1,39 @@
+name: Moderate chat
+
+# Started by the alerts loop (check.yml) about every 30 minutes. The hourly schedule is a safety net
+# (GitHub often runs schedules late). Separate from the alerts: if this fails, alerts still work.
+# The log is public: moderator.py prints counts only.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only count, change nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moderate-chat
+  cancel-in-progress: false
+
+jobs:
+  moderate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        run: python3 moderator_test.py
+      - name: Moderate
+        env:
+          CK_KEY_ID: ${{ secrets.CK_KEY_ID }}
+          CK_PRIVATE_KEY: ${{ secrets.CK_PRIVATE_KEY }}
+          CK_PROD_KEY_ID: ${{ secrets.CK_PROD_KEY_ID }}
+          CK_PROD_PRIVATE_KEY: ${{ secrets.CK_PROD_PRIVATE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then python3 moderator.py; else python3 moderator.py --apply; fi

@@ -23,6 +23,10 @@ The phone subscribes to `kind == X AND level >= its minimum AND zoneN CONTAINS i
 
 Areas are 1° × 1° grid cells (about 110 km). The phone shares only its cell, never its position.
 
+Chat moderation: `moderator.py` (workflow "Moderate chat", about every 30 minutes) deletes messages reported by
+3+ people, bans for 7 days after 3 such messages in 7 days, deletes chat records older than 30 days and
+"here now" marks older than 1 day. Its log holds counts only.
+
 No user data is stored here. `state.json` lists events already sent, so nothing is sent twice.
 Secrets (`CK_KEY_ID`, `CK_PRIVATE_KEY`) live in GitHub Actions secrets.
 

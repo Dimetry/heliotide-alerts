@@ -61,10 +61,12 @@ jobs:
           CK_PROD_KEY_ID: ${{ secrets.CK_PROD_KEY_ID }}
           CK_PROD_PRIVATE_KEY: ${{ secrets.CK_PROD_PRIVATE_KEY }}
           CK_ENV: ${{ vars.CK_ENV || 'development' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "heliotide-alerts"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           end=$(( $(date +%s) + 345 * 60 ))
+          n=0
           while [ "$(date +%s)" -lt "$end" ]; do
             started=$(date +%s)
             python3 checker.py || echo "check failed, will try again in 5 minutes"
@@ -78,6 +80,11 @@ jobs:
                 git pull -q --rebase && git push -q || echo "push failed, will try again"
               fi
             fi
+            # Chat moderation, every 6th round (about 30 minutes). Own workflow: it cannot stop the alerts.
+            if [ $(( n % 6 )) -eq 0 ]; then
+              gh workflow run moderate.yml -R "$GITHUB_REPOSITORY" --ref main >/dev/null || echo "moderation not started"
+            fi
+            n=$(( n + 1 ))
             wait=$(( 300 - ($(date +%s) - started) ))
             [ "$wait" -gt 0 ] && sleep "$wait"
           done
